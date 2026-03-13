@@ -23,9 +23,10 @@ def _run_single_bootstrap(
     N = len(spectra_binned)
     P = len(global_bins_arr)
 
-    pair_sim_sum = defaultdict(float)
-    pair_counts = defaultdict(int)
-    edge_support = Counter()
+    # Local dense accumulators (per-bootstrap)
+    sim_matrix = np.zeros((N, N), dtype=float)
+    pair_counts = np.zeros((N, N), dtype=np.int32)
+    edge_support = np.zeros((N, N), dtype=np.int32)
 
     sampled_indices = rng.integers(0, P, size=P)
     sampled_bins_arr = np.unique(global_bins_arr[sampled_indices])
@@ -55,8 +56,6 @@ def _run_single_bootstrap(
             )
         )
 
-    sim_matrix = np.zeros((N, N), dtype=float)
-
     scores = calculate_scores(
         references=spectra_boot,
         queries=spectra_boot,
@@ -80,9 +79,8 @@ def _run_single_bootstrap(
         sim_matrix[i, j] = sim
         sim_matrix[j, i] = sim
 
-        key = tuple(sorted((internal_ids[i], internal_ids[j])))
-        pair_sim_sum[key] += sim
-        pair_counts[key] += 1
+        pair_counts[i, j] += 1
+        pair_counts[j, i] += 1
 
     # mutual kNN
     k_eff = min(k, N - 1)
@@ -98,12 +96,12 @@ def _run_single_bootstrap(
     for i in range(N):
         for j in all_knn[i]:
             if i < j and i in all_knn[j]:
-                key = tuple(sorted((internal_ids[i], internal_ids[j])))
-                edge_support[key] += 1
+                edge_support[i, j] += 1
+                edge_support[j, i] += 1
 
     result = {
         "b": b,
-        "pair_sim_sum": pair_sim_sum,
+        "sim_matrix": sim_matrix.astype("float32"),
         "pair_counts": pair_counts,
         "edge_support": edge_support,
     }
@@ -135,9 +133,10 @@ def run_bootstrap_batch(
 
     # Fast mode - No history or bin tracking
     if not collect_history:
-        batch_pair_sim_sum = defaultdict(float)
-        batch_pair_counts = defaultdict(int)
-        batch_edge_support = Counter()
+        N = len(spectra_binned)
+        batch_sim_sum = np.zeros((N, N), dtype="float32")
+        batch_pair_counts = np.zeros((N, N), dtype=np.int32)
+        batch_edge_support = np.zeros((N, N), dtype=np.int32)
 
         for b in batch_bootstrap_ids:
             res = _run_single_bootstrap(
@@ -152,14 +151,9 @@ def run_bootstrap_batch(
                 track_bins=False,
             )
 
-            for key, val in res["pair_sim_sum"].items():
-                batch_pair_sim_sum[key] += val
-
-            for key, val in res["pair_counts"].items():
-                batch_pair_counts[key] += val
-
-            for key, val in res["edge_support"].items():
-                batch_edge_support[key] += val
+            batch_sim_sum += res["sim_matrix"]
+            batch_pair_counts += res["pair_counts"]
+            batch_edge_support += res["edge_support"]
 
             if verbose and ((b + 1) % 10 == 0 or (b + 1) == B):
                 print(f"[bootstrap {b+1}] done", flush=True)
@@ -172,7 +166,7 @@ def run_bootstrap_batch(
                 flush=True,
             )
 
-        return batch_pair_sim_sum, batch_pair_counts, batch_edge_support
+        return batch_sim_sum, batch_pair_counts, batch_edge_support
     
     # History mode - Collect detailed results for each bootstrap
     batch_results = []
@@ -252,9 +246,10 @@ def calculate_boostrapping(
     N = len(spectra_binned)
     global_bins_arr = np.asarray(global_bins)
 
-    pair_sim_sum = defaultdict(float)
-    pair_counts = defaultdict(int)
-    edge_support = Counter()
+    # Global dense aggregators across all batches/bootstraps
+    sim_sum = np.zeros((N, N), dtype="float32")
+    pair_counts = np.zeros((N, N), dtype=np.int32)
+    edge_support = np.zeros((N, N), dtype=np.int32)
 
     scan_labels = []
     feature_labels = []
@@ -356,15 +351,10 @@ def calculate_boostrapping(
 
         merge_start = time.perf_counter()
 
-        for ps, pc, es in results:
-            for key, val in ps.items():
-                pair_sim_sum[key] += val
-
-            for key, val in pc.items():
-                pair_counts[key] += val
-
-            for key, val in es.items():
-                edge_support[key] += val
+        for batch_sim_sum, batch_pair_counts, batch_edge_support in results:
+            sim_sum += batch_sim_sum
+            pair_counts += batch_pair_counts
+            edge_support += batch_edge_support
 
         merge_end = time.perf_counter()
         total_end = time.perf_counter()
@@ -373,20 +363,13 @@ def calculate_boostrapping(
             print(f"Merge finished in {merge_end - merge_start:.2f} seconds", flush=True)
             print(f"Total bootstrapping completed in {total_end - total_start:.2f} seconds", flush=True)
 
+        # Build mean similarity matrix
         mean_sim = np.eye(N, dtype="float32")
-        for (id_i, id_j), total in pair_sim_sum.items():
-            i = id_to_index[id_i]
-            j = id_to_index[id_j]
-            cnt = pair_counts[(id_i, id_j)]
-            mean_sim[i, j] = total / cnt
-            mean_sim[j, i] = total / cnt
+        mask = pair_counts > 0
+        mean_sim[mask] = sim_sum[mask] / pair_counts[mask]
 
-        edge_mat = np.zeros((N, N), dtype="float32")
-        for (id_i, id_j), cnt in edge_support.items():
-            i = id_to_index[id_i]
-            j = id_to_index[id_j]
-            edge_mat[i, j] = cnt / B
-            edge_mat[j, i] = cnt / B
+        # Build edge support matrix (fraction of bootstraps with edge)
+        edge_mat = edge_support.astype("float32") / float(B)
 
         df_mean_sim = pd.DataFrame(mean_sim, index=out_labels, columns=out_labels)
         df_edge_sup = pd.DataFrame(edge_mat, index=out_labels, columns=out_labels)
@@ -413,30 +396,15 @@ def calculate_boostrapping(
     hist_missing_bins = []
 
     for res in flat_results:
-        for key, val in res["pair_sim_sum"].items():
-            pair_sim_sum[key] += val
-
-        for key, val in res["pair_counts"].items():
-            pair_counts[key] += val
-
-        for key, val in res["edge_support"].items():
-            edge_support[key] += val
+        sim_sum += res["sim_matrix"]
+        pair_counts += res["pair_counts"]
+        edge_support += res["edge_support"]
 
         cur_mean = np.eye(N, dtype="float32")
-        for (id_i, id_j), total in pair_sim_sum.items():
-            i = id_to_index[id_i]
-            j = id_to_index[id_j]
-            cnt = pair_counts[(id_i, id_j)]
-            cur_mean[i, j] = total / cnt
-            cur_mean[j, i] = total / cnt
+        mask = pair_counts > 0
+        cur_mean[mask] = sim_sum[mask] / pair_counts[mask]
 
-        cur_edge = np.zeros((N, N), dtype="float32")
-        denom = float(res["b"] + 1)
-        for (id_i, id_j), cnt in edge_support.items():
-            i = id_to_index[id_i]
-            j = id_to_index[id_j]
-            cur_edge[i, j] = cnt / denom
-            cur_edge[j, i] = cnt / denom
+        cur_edge = edge_support.astype("float32") / float(res["b"] + 1)
 
         hist_mean_sim.append(cur_mean)
         hist_edge_sup.append(cur_edge)
